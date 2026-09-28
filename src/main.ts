@@ -14,6 +14,7 @@ const MICROSOFT_TENANT_ID = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a';
 const TEAMS_APP_ID = '5e3ce6c0-2b1f-4285-8d4b-75ee78787346';
 const SKYPE_RESOURCE = 'https://api.spaces.skype.com';
 const CHAT_SVC_AGG_RESOURCE = 'https://chatsvcagg.teams.microsoft.com';
+const REDIRECT_URI = 'https://teams.microsoft.com/go';
 const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) MicrosoftTeams-Preview/1.4.00.7556 Chrome/80.0.3987.163 Electron/8.5.5 Safari/537.36';
 
 type TeamsSkype = 'teams' | 'skype' | 'chatsvcagg';
@@ -56,7 +57,7 @@ function getLoginURL(type: TeamsSkype, tenantId: string) : string {
   }
   loginUrl.searchParams.append('client_id', TEAMS_APP_ID);
   loginUrl.searchParams.append('client-request-id', uuidv4());
-  loginUrl.searchParams.append('redirect_uri', 'https://teams.microsoft.com/go');
+  loginUrl.searchParams.append('redirect_uri', REDIRECT_URI);
   loginUrl.searchParams.append('x-client-SKU', 'Js');
   loginUrl.searchParams.append('x-client-Ver', '1.0.9');
   loginUrl.searchParams.append('nonce', uuidv4());
@@ -105,6 +106,101 @@ function checkTokens() {
   }
 }
 
+async function handleRedirect(url: string) {
+  const token = url.replace(`${REDIRECT_URI}#`, '');
+  const searchParams = new URLSearchParams(token);
+  let teamsToken = searchParams.get('id_token');
+
+  if (teamsToken === null) {
+    teamsToken = searchParams.get('access_token');
+  }
+
+  const decoded = jwt.decode(teamsToken);
+  if (decoded === null) {
+    console.warn(`Invalid JWT provided: ${searchParams}`);
+    if (searchParams.has('error')) {
+      const err = searchParams.get('error');
+      const errDesc = searchParams.get('error_description');
+      console.error(`Got error = ${err}: ${errDesc}`);
+      switch (err) {
+        case 'interaction_required':
+          // User has to interact!
+          console.error('User interaction is required (e.g: MFA). Are you using "?prompt=none" ?');
+          break;
+        default:
+          // Can't handle this, sorry
+      }
+    }
+    return;
+  }
+
+  if (typeof (decoded) === 'string') {
+    console.error('Invalid decoded JWT: is a string');
+    return;
+  }
+
+  if (decoded.tid === MICROSOFT_TENANT_ID && decoded.aud === SKYPE_RESOURCE) {
+    // We need a tenant selection
+    console.log(`Tenant ID is MICROSOFT: aud=${decoded.aud}`);
+    // Get Tenant list
+    try {
+      const tenants = await (await getTenants(teamsToken)).data;
+      // Pick the first tenant and authorize Skype
+      currentTenant = tenants[0].tenantId;
+      authorize('skype', currentTenant);
+    } catch (err) {
+      console.error(`Unable to get tenants: ${err}`);
+    }
+    // win.webContents.stop();
+    // win.webContents.loadURL('https://teams.microsoft.com/go');
+    return;
+  }
+
+  if (decoded.tid !== MICROSOFT_TENANT_ID && currentTenant === null) {
+    // Company account
+    currentTenant = decoded.tid;
+  }
+
+  if (currentTenant === null) {
+    currentTenant = 'common';
+  }
+
+  tokenResponseCount += 1;
+
+  if (tokenResponseCount > 5) {
+    console.error('Redirecting too many times, stopping');
+    win.webContents.stop();
+    return;
+  }
+
+  console.log(`Audience: ${decoded.aud}`);
+  console.log('Decoded', decoded);
+
+  win.webContents.stop();
+
+  if (decoded.aud === TEAMS_APP_ID) {
+    // Teams Token
+    console.log('Got a Teams token');
+    saveTeamsToken(teamsToken, 'teams');
+    checkTokens();
+    tokens.teams = true;
+    authorize('skype', currentTenant);
+  } else if (decoded.aud === SKYPE_RESOURCE) {
+    console.log('Got a Skype token');
+    saveTeamsToken(teamsToken, 'skype');
+    authorize('chatsvcagg', currentTenant);
+    tokens.skype = true;
+    checkTokens();
+  } else if (decoded.aud === CHAT_SVC_AGG_RESOURCE) {
+    console.log('Got a ChatSvcAgg token');
+    saveTeamsToken(teamsToken, 'chatsvcagg');
+    tokens.chatsvcagg = true;
+    checkTokens();
+  } else {
+    console.error(`Invalid audience ${decoded.aud} found.`);
+  }
+}
+
 // Disable GPU sandbox for WSL2/wslg compatibility
 app.commandLine.appendSwitch('disable-gpu-sandbox');
 
@@ -143,101 +239,18 @@ app.whenReady().then(() => {
       }
     });
 
+    // Teams now server-redirects /go to /error/eoa, so the token has to be
+    // grabbed from the redirect itself, before that page ever loads.
+    win.webContents.on('will-redirect', async (e, url) => {
+      if (url.startsWith(REDIRECT_URI)) {
+        e.preventDefault();
+        await handleRedirect(url);
+      }
+    });
+
     win.webContents.on('did-navigate', async (e, url) => {
-      if (url.startsWith('https://teams.microsoft.com/go')) {
-        const token = url.replace('https://teams.microsoft.com/go#', '');
-        const searchParams = new URLSearchParams(token);
-        let teamsToken = searchParams.get('id_token');
-
-        if (teamsToken === null) {
-          teamsToken = searchParams.get('access_token');
-        }
-
-        const decoded = jwt.decode(teamsToken);
-        if (decoded === null) {
-          console.warn(`Invalid JWT provided: ${searchParams}`);
-          if (searchParams.has('error')) {
-            const err = searchParams.get('error');
-            const errDesc = searchParams.get('error_description');
-            console.error(`Got error = ${err}: ${errDesc}`);
-            switch (err) {
-              case 'interaction_required':
-                // User has to interact!
-                console.error('User interaction is required (e.g: MFA). Are you using "?prompt=none" ?');
-                break;
-              default:
-                // Can't handle this, sorry
-            }
-          }
-          return;
-        }
-
-        if (typeof (decoded) === 'string') {
-          console.error('Invalid decoded JWT: is a string');
-          return;
-        }
-
-        if (decoded.tid === MICROSOFT_TENANT_ID && decoded.aud === SKYPE_RESOURCE) {
-          // We need a tenant selection
-          console.log(`Tenant ID is MICROSOFT: aud=${decoded.aud}`);
-          // Get Tenant list
-          try {
-            const tenants = await (await getTenants(teamsToken)).data;
-            // Pick the first tenant and authorize Skype
-            currentTenant = tenants[0].tenantId;
-            authorize('skype', currentTenant);
-          } catch (err) {
-            console.error(`Unable to get tenants: ${err}`);
-          }
-          // win.webContents.stop();
-          // win.webContents.loadURL('https://teams.microsoft.com/go');
-          return;
-        }
-
-        if (decoded.tid !== MICROSOFT_TENANT_ID && currentTenant === null) {
-          // Company account
-          currentTenant = decoded.tid;
-        }
-
-        if (currentTenant === null) {
-          currentTenant = 'common';
-        }
-
-        tokenResponseCount += 1;
-
-        if (tokenResponseCount > 5) {
-          console.error('Redirecting too many times, stopping');
-          e.preventDefault();
-          win.webContents.stop();
-          return;
-        }
-
-        console.log(`Audience: ${decoded.aud}`);
-        console.log('Decoded', decoded);
-
-        win.webContents.stop();
-
-        if (decoded.aud === TEAMS_APP_ID) {
-          // Teams Token
-          console.log('Got a Teams token');
-          saveTeamsToken(teamsToken, 'teams');
-          checkTokens();
-          tokens.teams = true;
-          authorize('skype', currentTenant);
-        } else if (decoded.aud === SKYPE_RESOURCE) {
-          console.log('Got a Skype token');
-          saveTeamsToken(teamsToken, 'skype');
-          authorize('chatsvcagg', currentTenant);
-          tokens.skype = true;
-          checkTokens();
-        } else if (decoded.aud === CHAT_SVC_AGG_RESOURCE) {
-          console.log('Got a ChatSvcAgg token');
-          saveTeamsToken(teamsToken, 'chatsvcagg');
-          tokens.chatsvcagg = true;
-          checkTokens();
-        } else {
-          console.error(`Invalid audience ${decoded.aud} found.`);
-        }
+      if (url.startsWith(REDIRECT_URI)) {
+        await handleRedirect(url);
       }
     });
 
